@@ -1,3 +1,5 @@
+import os
+
 import torch
 from transformers import AutoTokenizer, T5EncoderModel
 
@@ -70,15 +72,24 @@ class T5Embedder:
         self.use_text_preprocessing = use_text_preprocessing
         self.hf_token = hf_token
 
-        assert from_pretrained in self.available_models
+        # Prefer repo-local ``google/t5-v1_1-xxl`` so offline runs skip hub cache.
+        assert from_pretrained in self.available_models or os.path.isdir(
+            str(from_pretrained)
+        ), f"Unknown T5 path {from_pretrained}"
+        load_name = from_pretrained
+        if from_pretrained in self.available_models:
+            local_dir = os.path.join(os.getcwd(), from_pretrained)
+            if os.path.isdir(local_dir):
+                load_name = os.path.abspath(local_dir)
+
         self.tokenizer = AutoTokenizer.from_pretrained(
-            from_pretrained,
+            load_name,
             model_max_length=model_max_length,
             cache_dir=cache_dir,
             local_files_only=local_files_only,
         )
         self.model = T5EncoderModel.from_pretrained(
-            from_pretrained,
+            load_name,
             cache_dir=cache_dir,
             local_files_only=local_files_only,
             **t5_model_kwargs,

@@ -19,6 +19,7 @@ way it is in stage-1/stage-3 training, so no architectural change is needed.
 | `ec1_franka.yaml`     | Franka Panda + 1-DoF gripper                       | 6 + 1   | right_arm[0:6], right_hand[0]       |
 | `ec2_aloha.yaml`      | Cobot Magic ALOHA — 2 × (6-DoF arm + 1-DoF gripper) | 14      | right_arm[0:6], right_hand[0], left_arm[0:6], left_hand[0] |
 | `ec3_g1_inspire.yaml` | Unitree G1 7-DoF arm + Inspire Hand 6-DoF          | 13      | right_arm[0:7]\*, right_hand[0:6]   |
+| `ec4_dexjoco_bimanual_assembly.yaml` | DexJoCo dual Panda + dual Allegro (insert) | 44 | native 16-DoF hands; Stage-1 I/O is expanded from 36D to 44D |
 
 \* For G1's 7-DoF arm we use one extra dim borrowed from the right-hand block;
 this convention can be changed in the YAML if your retargeting differs.
@@ -32,6 +33,10 @@ this convention can be changed in the YAML if your retargeting differs.
   mechanism in `train/dataset.py`).
 * `ec2_aloha.yaml`: head + both wrist cameras → `[1, 1, 1, 0]`.
 * `ec3_g1_inspire.yaml`: head + ego (third-view) → `[1, 0, 0, 1]`.
+* `ec4_dexjoco_bimanual_assembly.yaml`: ego + both wrists (no front) → `[1, 1, 1, 0]`.
+  Unlike the paper's lower-DoF EC examples, this adaptation preserves all Allegro joints:
+`state46` is converted to native policy44. Fine-tuning expands Stage-1 I/O from 36-D
+to 44-D by inheriting same-shape layers and scale-init of `state_adaptor.0` + `fc2` only.
 
 ## Usage
 
@@ -48,3 +53,17 @@ bash post_train.sh \
     --no_quality_weights     # cross-embodiment fine-tune is small (100 demos),
                              # the paper does not use the discriminator here.
 ```
+
+DexJoCo insert (EC-4) after Stage-1 on Dexora `airbot_assemble`:
+
+```bash
+bash scripts/download_dexora_pretrain.sh          # FAMILY=airbot_assemble
+bash scripts/s_dexora_pretrain_assemble.sh
+PRETRAINED=checkpoints/dexora-400m-pretrain-assemble \
+    bash scripts/s_dexjoco_finetune.sh
+```
+
+The released DexJoCo videos are AV1. On the current training host, OpenCV cannot
+decode them and previously returned black frames. Run
+`bash scripts/transcode_dexjoco_videos.sh` first; the fine-tuning launcher now
+defaults to the validated H.264 mirror and aborts if any sampled camera is black.

@@ -11,6 +11,10 @@ from tqdm import tqdm
 
 from lerobot.datasets.lerobot_dataset import LeRobotDatasetMetadata, LeRobotDataset
 from .bson_vla_dataset import plot_distributions
+from .pyav_video_backend import install_pyav_video_backend
+
+# torchvision>=0.26 dropped VideoReader; keep lerobot video decode working.
+install_pyav_video_backend()
 
 
 class LeRobotVLADataset:
@@ -454,7 +458,13 @@ if __name__ == "__main__":
     args = parser.parse_args()
     
     # --- Dataset Initialization ---
-    ds = LeRobotVLADataset(repo_dir=args.repo_dir, normalize_mode=args.normalize, stats_file=args.stats_file, load_imgs=not args.stat)
+    from data.dexjoco_lerobot_dataset import maybe_make_lerobot_dataset
+    ds = maybe_make_lerobot_dataset(
+        repo_dir=args.repo_dir,
+        normalize_mode=args.normalize,
+        stats_file=args.stats_file,
+        load_imgs=not args.stat,
+    )
     
     if len(ds) == 0:
         print("\nDataset initialized but contains no valid episodes.")

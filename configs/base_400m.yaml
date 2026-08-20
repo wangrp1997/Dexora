@@ -47,6 +47,11 @@ model:
     # because RDTRunner / compute_logpi.py handle both branches.
     prediction_type: epsilon
     clip_sample: False
+    # Avoid the near-zero-SNR endpoint where small epsilon errors are amplified
+    # into unbounded x0 estimates by DPM-Solver++.
+    lambda_min_clipped: -1.0
+    thresholding: True
+    sample_max_value: 1.0
   ema:
     update_after_step: 0
     inv_gamma: 1.0

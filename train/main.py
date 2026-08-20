@@ -1,5 +1,11 @@
 import argparse
 import os
+
+# torchvision>=0.26 dropped VideoReader; patch lerobot pyav path first.
+from data.pyav_video_backend import install_pyav_video_backend
+
+install_pyav_video_backend()
+
 from train.train import train
 
 from accelerate.logging import get_logger
@@ -92,6 +98,12 @@ def parse_args(input_args=None):
             "head_joint_2, spine_joint, fixed by the AIRBOT SDK but not "
             "modelled). Set to 0/None to keep all 39 dims."
         ),
+    )
+    parser.add_argument(
+        "--partial_copy_map",
+        type=str,
+        default=None,
+        help="JSON target->source state/action dimension map for diagnostic partial-copy loading.",
     )
     parser.add_argument(
         "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
@@ -326,6 +338,40 @@ def parse_args(input_args=None):
     )
 
     parser.add_argument(
+        "--backbone_lr_mult",
+        type=float,
+        default=1.0,
+        help="Learning-rate multiplier for inherited (non-rebuilt) RDT parameters.",
+    )
+    parser.add_argument(
+        "--io_lr_mult",
+        type=float,
+        default=1.0,
+        help="Learning-rate multiplier for rebuilt I/O layers (state_adaptor.0, fc2).",
+    )
+    parser.add_argument(
+        "--train_fresh_io_only",
+        action="store_true",
+        help="Freeze inherited RDT parameters and train only rebuilt 36->44 I/O layers.",
+    )
+    parser.add_argument(
+        "--dexjoco_action_target",
+        choices=("absolute", "residual_from_state"),
+        default="absolute",
+        help="DexJoCo-only action target; residual targets are anchored at current state.",
+    )
+    parser.add_argument(
+        "--checkpoint_steps",
+        type=str,
+        default="",
+        help="Comma-separated extra steps to save, e.g. 100,250,500.",
+    )
+    parser.add_argument(
+        "--save_initial_checkpoint",
+        action="store_true",
+        help="Save checkpoint-0 after load / I/O expand, before the first step.",
+    )
+    parser.add_argument(
         "--probe_period",
         type=int,
         default=0,
@@ -336,6 +382,26 @@ def parse_args(input_args=None):
             "sanity-checking normalization, image augmentation, and camera "
             "ordering. Default 0 disables probing."
         ),
+    )
+    parser.add_argument(
+        "--early_window_prob",
+        type=float,
+        default=0.0,
+        help=(
+            "DexJoCo only: probability of sampling frame 0..early_window_frames-1 "
+            "within a random episode instead of uniform global frames."
+        ),
+    )
+    parser.add_argument(
+        "--early_window_frames",
+        type=int,
+        default=32,
+        help="DexJoCo early-window oversample length (inclusive frame 0).",
+    )
+    parser.add_argument(
+        "--horizon_loss_weighting",
+        action="store_true",
+        help="Upweight diffusion loss on action-chunk steps 0-7 for start-align repair.",
     )
 
     if input_args is not None:

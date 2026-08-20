@@ -38,6 +38,7 @@ from models.ema_model import EMAModel
 from models.multimodal_encoder.siglip_encoder import SiglipVisionTower
 from models.multimodal_encoder.t5_encoder import T5Embedder
 from models.rdt_runner import RDTRunner
+from models.sample_weighting import start_align_horizon_weights
 from train.dataset import DataCollatorForVLAConsumerDataset, VLAConsumerDataset
 from train.sample import log_sample_res
 
@@ -171,20 +172,11 @@ def train(args, logger):
     vision_encoder = SiglipVisionTower(vision_tower=args.pretrained_vision_encoder_name_or_path, args=None)
     image_processor = vision_encoder.image_processor
 
-    # Load from a pretrained checkpoint
-    if (
-        args.pretrained_model_name_or_path is not None
-        and not os.path.isfile(args.pretrained_model_name_or_path)
-    ):
-        logger.info("Constructing model from pretrained checkpoint.")
-        rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
-    else:
-        logger.info("Constructing model from provided config.")
-        # Calculate the image condition length
-        img_cond_len = (config["common"]["img_history_size"] 
-                        * config["common"]["num_cameras"] 
+    def _build_rdt_from_config():
+        img_cond_len = (config["common"]["img_history_size"]
+                        * config["common"]["num_cameras"]
                         * vision_encoder.num_patches)
-        rdt = RDTRunner(
+        return RDTRunner(
             action_dim=config["common"]["state_dim"],
             pred_horizon=config["common"]["action_chunk_size"],
             config=config["model"],
@@ -194,20 +186,56 @@ def train(args, logger):
             max_lang_cond_len=config["dataset"]["tokenizer_max_length"],
             img_cond_len=img_cond_len,
             img_pos_embed_config=[
-                # No initial pos embed in the last grid size
-                # since we've already done in ViT
-                ("image", (config["common"]["img_history_size"], 
-                    config["common"]["num_cameras"], 
-                    -vision_encoder.num_patches)),  
+                ("image", (config["common"]["img_history_size"],
+                    config["common"]["num_cameras"],
+                    -vision_encoder.num_patches)),
             ],
             lang_pos_embed_config=[
-                # Similarly, no initial pos embed for language
                 ("lang", -config["dataset"]["tokenizer_max_length"]),
             ],
             dtype=weight_dtype,
         )
-        
+
+    # Load from a pretrained checkpoint
+    if (
+        args.pretrained_model_name_or_path is not None
+        and not os.path.isfile(args.pretrained_model_name_or_path)
+    ):
+        from models.compatible_load import load_compatible_pretrained, peek_action_dim
+
+        target_dim = int(config["common"]["state_dim"])
+        ckpt_dim = peek_action_dim(args.pretrained_model_name_or_path)
+        if ckpt_dim is not None and ckpt_dim != target_dim:
+            logger.info(
+                "I/O expand %d -> %d: inherit same-shape layers; "
+                "scale-init state_adaptor.0 and final_layer.fc2 only.",
+                ckpt_dim,
+                target_dim,
+            )
+            rdt = _build_rdt_from_config()
+            load_compatible_pretrained(
+                rdt,
+                args.pretrained_model_name_or_path,
+                partial_copy_map=getattr(args, "partial_copy_map", None),
+            )
+        else:
+            logger.info("Constructing model from pretrained checkpoint.")
+            rdt = RDTRunner.from_pretrained(args.pretrained_model_name_or_path)
+    else:
+        logger.info("Constructing model from provided config.")
+        rdt = _build_rdt_from_config()
                                                                        
+    if getattr(args, "train_fresh_io_only", False):
+        from models.compatible_load import freeze_except_fresh_io
+
+        trainable, frozen = freeze_except_fresh_io(rdt)
+        logger.info(
+            "Fresh-I/O-only warmup: trainable=%d frozen=%d keys=%s",
+            len(trainable),
+            len(frozen),
+            trainable,
+        )
+
     ema_rdt = copy.deepcopy(rdt)
     ema_model = EMAModel(
         ema_rdt,
@@ -256,10 +284,40 @@ def train(args, logger):
     else:
         optimizer_class = torch.optim.AdamW
 
-    # Optimizer creation
-    params_to_optimize = rdt.parameters()
+    # Optimizer creation. On 36->44 expand, put rebuilt I/O layers in a
+    # higher-LR group; inherited backbone stays at backbone_lr_mult.
+    from models.compatible_load import is_fresh_io_key
+
+    backbone_mult = float(getattr(args, "backbone_lr_mult", 1.0))
+    io_mult = float(getattr(args, "io_lr_mult", 1.0))
+    fresh_params, rest_params = [], []
+    for name, param in rdt.named_parameters():
+        if not param.requires_grad:
+            continue
+        if is_fresh_io_key(name):
+            fresh_params.append(param)
+        else:
+            rest_params.append(param)
+    param_groups = []
+    if rest_params:
+        param_groups.append(
+            {"params": rest_params, "lr": args.learning_rate * backbone_mult}
+        )
+    if fresh_params:
+        param_groups.append(
+            {"params": fresh_params, "lr": args.learning_rate * io_mult}
+        )
+    logger.info(
+        "AdamW groups: rest=%d (lr=%.2e x%.3f) fresh_io=%d (lr=%.2e x%.3f)",
+        len(rest_params),
+        args.learning_rate * backbone_mult,
+        backbone_mult,
+        len(fresh_params),
+        args.learning_rate * io_mult,
+        io_mult,
+    )
     optimizer = optimizer_class(
-        params_to_optimize,
+        param_groups,
         lr=args.learning_rate,
         betas=(args.adam_beta1, args.adam_beta2),
         weight_decay=args.adam_weight_decay,
@@ -280,6 +338,9 @@ def train(args, logger):
         bson_root=getattr(args, "bson_root", None),
         stats_file=getattr(args, "stats_file", None),
         state_dim_keep=getattr(args, "state_dim_keep", 36),
+        early_window_prob=float(getattr(args, "early_window_prob", 0.0)),
+        early_window_frames=int(getattr(args, "early_window_frames", 32)),
+        dexjoco_action_target=getattr(args, "dexjoco_action_target", "absolute"),
     )
     train_dataset = VLAConsumerDataset(
         image_aug=args.image_aug,
@@ -307,6 +368,15 @@ def train(args, logger):
         pin_memory=True,
         persistent_workers=True
     )
+    horizon_weights = None
+    if getattr(args, "horizon_loss_weighting", False):
+        horizon_weights = start_align_horizon_weights(
+            int(config["common"]["action_chunk_size"])
+        )
+        logger.info(
+            "Start-align horizon loss weighting enabled: %s",
+            horizon_weights.tolist(),
+        )
     sample_dataloader = torch.utils.data.DataLoader(
         sample_dataset,
         batch_size=args.sample_batch_size,
@@ -385,8 +455,14 @@ def train(args, logger):
    
     # Potentially load in the weights and states from a previous save
     if args.resume_from_checkpoint:
+        resume_dir = args.output_dir
         if args.resume_from_checkpoint != "latest":
-            path = os.path.basename(args.resume_from_checkpoint)
+            requested_resume = os.path.expanduser(args.resume_from_checkpoint)
+            if os.path.isdir(requested_resume):
+                resume_dir = os.path.dirname(requested_resume)
+                path = os.path.basename(os.path.normpath(requested_resume))
+            else:
+                path = os.path.basename(requested_resume)
         else:
             # Get the mos recent checkpoint
             dirs = os.listdir(args.output_dir)
@@ -401,20 +477,49 @@ def train(args, logger):
             args.resume_from_checkpoint = None
         else:
             accelerator.print(f"Resuming from checkpoint {path}")
+            checkpoint_dir = os.path.join(resume_dir, path)
             try:
-                accelerator.load_state(os.path.join(args.output_dir, path)) # load_module_strict=False
+                accelerator.load_state(checkpoint_dir) # load_module_strict=False
             except:
                 # load deepspeed's state_dict
                 logger.info("Resuming training state failed. Attempting to only load from model checkpoint.")
-                checkpoint = torch.load(os.path.join(args.output_dir, path, "pytorch_model", "mp_rank_00_model_states.pt"))
-                rdt.module.load_state_dict(checkpoint["module"])
+                model_state_path = os.path.join(checkpoint_dir, "pytorch_model", "mp_rank_00_model_states.pt")
+                if not os.path.isfile(model_state_path):
+                    model_state_path = os.path.join(checkpoint_dir, "pytorch_model.bin")
+                checkpoint = torch.load(model_state_path, map_location="cpu")
+                if "module" in checkpoint:
+                    checkpoint = checkpoint["module"]
+                rdt.module.load_state_dict(checkpoint)
                 
-            load_model(ema_rdt, os.path.join(args.output_dir, path, "ema", "model.safetensors"))
+            load_model(ema_rdt, os.path.join(checkpoint_dir, "ema", "model.safetensors"))
             global_step = int(path.split("-")[1])
 
             resume_global_step = global_step * args.gradient_accumulation_steps
             first_epoch = global_step // num_update_steps_per_epoch
             resume_step = resume_global_step % (num_update_steps_per_epoch * args.gradient_accumulation_steps)
+
+    extra_ckpt_steps = set()
+    raw_ckpt_steps = getattr(args, "checkpoint_steps", "") or ""
+    if str(raw_ckpt_steps).strip():
+        extra_ckpt_steps = {
+            int(x) for x in str(raw_ckpt_steps).split(",") if x.strip()
+        }
+
+    def _save_training_checkpoint(step: int) -> None:
+        save_path = os.path.join(args.output_dir, f"checkpoint-{step}")
+        accelerator.save_state(save_path)
+        ema_save_path = os.path.join(save_path, "ema")
+        accelerator.save_model(ema_rdt, ema_save_path)
+        logger.info(f"Saved state to {save_path}")
+
+    def _should_save_checkpoint(step: int) -> bool:
+        if step in extra_ckpt_steps:
+            return True
+        period = int(args.checkpointing_period)
+        return period > 0 and step % period == 0
+
+    if getattr(args, "save_initial_checkpoint", False) and global_step == 0:
+        _save_training_checkpoint(0)
 
     # Only show the progress bar once on each machine.
     progress_bar = tqdm(range(global_step, args.max_train_steps), disable=not accelerator.is_local_main_process)
@@ -473,7 +578,8 @@ def train(args, logger):
                     state_tokens=states,
                     action_gt=actions,
                     action_mask=state_elem_mask,
-                    ctrl_freqs=ctrl_freqs
+                    ctrl_freqs=ctrl_freqs,
+                    horizon_weights=horizon_weights,
                 )
 
                 accelerator.backward(loss)
@@ -491,12 +597,8 @@ def train(args, logger):
                 progress_bar.update(1)
                 global_step += 1
 
-                if global_step % args.checkpointing_period == 0:
-                    save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
-                    accelerator.save_state(save_path)
-                    ema_save_path = os.path.join(save_path, f"ema")
-                    accelerator.save_model(ema_rdt, ema_save_path)
-                    logger.info(f"Saved state to {save_path}")
+                if _should_save_checkpoint(global_step):
+                    _save_training_checkpoint(global_step)
 
                 if args.sample_period > 0 and global_step % args.sample_period == 0:
                     with torch.cuda.amp.autocast(enabled=True):

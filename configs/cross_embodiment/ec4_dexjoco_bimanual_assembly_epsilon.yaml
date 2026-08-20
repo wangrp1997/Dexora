@@ -1,0 +1,98 @@
+# EC-4 ablation: DexJoCo relative wrist rotvecs with epsilon prediction.
+# This file intentionally differs from ec4_dexjoco_bimanual_assembly.yaml only
+# in the diffusion prediction target so the v_prediction comparison is causal.
+
+common:
+  img_history_size: 1
+  action_chunk_size: 32
+  num_cameras: 4
+  num_patches_per_view: 729
+  state_dim: 44
+
+dataset:
+  buf_path: /path/to/buffer
+  buf_num_chunks: 512
+  buf_chunk_size: 512
+  epsd_len_thresh_low: 32
+  epsd_len_thresh_high: 2048
+  image_aspect_ratio: pad
+  tokenizer_max_length: 1024
+
+model:
+  lang_adaptor: mlp2x_gelu
+  img_adaptor: mlp2x_gelu
+  state_adaptor: mlp3x_gelu
+  lang_token_dim: 4096
+  img_token_dim: 1152
+  state_token_dim: 44
+  rdt:
+    hidden_size: 1024
+    depth: 28
+    num_heads: 16
+    cond_pos_embed_type: multimodal
+  noise_scheduler:
+    type: ddpm
+    num_train_timesteps: 1000
+    num_inference_timesteps: 5
+    beta_schedule: squaredcos_cap_v2
+    prediction_type: epsilon
+    clip_sample: False
+  ema:
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+embodiment:
+  name: "DexJoCo dual Panda + dual Allegro (bimanual_assembly insert, epsilon ablation)"
+  dof: 44
+  prompt: "Grasp the tray with the left hand and the peg with the right hand, then insert the peg into the hole."
+  state_elem_mask:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+  camera_active_mask: [1, 1, 1, 0]
+  fps: 30
+  dataset_root: /mnt/hdd/dexora/data/dexjoco_bimanual_assembly_h264

@@ -33,6 +33,7 @@ __all__ = [
     "warmup_weights",
     "scores_to_train_weights",
     "weighted_mse_loss",
+    "start_align_horizon_weights",
 ]
 
 
@@ -112,10 +113,23 @@ def scores_to_train_weights(
     return w
 
 
+def start_align_horizon_weights(horizon: int) -> torch.Tensor:
+    """Per-chunk-step weights for DexJoCo episode-start repair (steps 0-7 upweighted)."""
+    weights = torch.ones(int(horizon), dtype=torch.float32)
+    if horizon > 0:
+        weights[0:2] = 4.0
+    if horizon > 2:
+        weights[2:4] = 3.0
+    if horizon > 4:
+        weights[4:min(8, horizon)] = 2.0
+    return weights
+
+
 def weighted_mse_loss(
     pred: torch.Tensor,
     target: torch.Tensor,
     sample_weights: Optional[torch.Tensor] = None,
+    horizon_weights: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
     """
     Per-sample weighted MSE that implements Dexora Eq.(8).
@@ -132,6 +146,8 @@ def weighted_mse_loss(
         target:         ``(B, ...)`` matching ground truth.
         sample_weights: ``(B,)`` non-negative weights. If ``None``, behaves
             exactly like ``F.mse_loss(pred, target)``.
+        horizon_weights: Optional ``(H,)`` or ``(B, H)`` weights applied to
+            the action-chunk axis before reducing to per-sample MSE.
 
     Returns:
         ``(loss, info)`` where ``info`` contains diagnostic tensors:
@@ -143,6 +159,30 @@ def weighted_mse_loss(
     )
 
     diff_sq = (pred.float() - target.float()) ** 2  # (B, ...)
+    if horizon_weights is not None and diff_sq.ndim >= 2:
+        hw = horizon_weights.to(device=diff_sq.device, dtype=diff_sq.dtype)
+        if hw.ndim != 1:
+            raise ValueError(
+                f"horizon_weights must be 1-D (H,), got shape {tuple(hw.shape)}"
+            )
+        if diff_sq.ndim == 3:
+            # (B, H, D) action chunks
+            if hw.shape[0] != diff_sq.shape[1]:
+                raise ValueError(
+                    f"horizon_weights length {hw.shape[0]} != chunk length {diff_sq.shape[1]}"
+                )
+            hw = hw.view(1, -1, 1)
+        elif diff_sq.ndim == 2:
+            if hw.shape[0] != diff_sq.shape[1]:
+                raise ValueError(
+                    f"horizon_weights length {hw.shape[0]} != chunk length {diff_sq.shape[1]}"
+                )
+            hw = hw.view(1, -1)
+        else:
+            raise ValueError(
+                f"horizon_weights unsupported for pred rank {diff_sq.ndim}: {tuple(diff_sq.shape)}"
+            )
+        diff_sq = diff_sq * hw
     if diff_sq.ndim == 1:
         per_sample_mse = diff_sq
     else:

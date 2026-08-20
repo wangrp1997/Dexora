@@ -1,3 +1,5 @@
+import os
+
 import torch
 import torch.nn as nn
 from transformers import AutoConfig, SiglipImageProcessor, SiglipVisionModel
@@ -24,8 +26,14 @@ class SiglipVisionTower(nn.Module):
             print('{} is already loaded, `load_model` called again, skipping.'.format(self.vision_tower_name))
             return
 
-        self.image_processor = SiglipImageProcessor.from_pretrained(self.vision_tower_name)
-        self.vision_tower = SiglipVisionModel.from_pretrained(self.vision_tower_name, device_map=device_map)
+        name = self.vision_tower_name
+        if not os.path.isdir(name):
+            local = os.path.join(os.getcwd(), name)
+            if os.path.isdir(local):
+                name = os.path.abspath(local)
+
+        self.image_processor = SiglipImageProcessor.from_pretrained(name)
+        self.vision_tower = SiglipVisionModel.from_pretrained(name, device_map=device_map)
         self.vision_tower.eval()
 
         self.is_loaded = True

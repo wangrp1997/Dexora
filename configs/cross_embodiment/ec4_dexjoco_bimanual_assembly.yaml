@@ -1,0 +1,107 @@
+# EC-4: DexJoCo bimanual_assembly (dual Panda + dual Allegro, insert).
+# Stage-1 stays 36-D on official assemble. Finetune expands I/O to native 44-D.
+# Inherit same-shape layers; rebuild only state_adaptor.0 and final_layer.fc2
+# with N(0, src.std). This is a cold start, not AIRBOT/xHand skill transfer.
+#
+#   policy44 = [R xyz+rotvec(6) | R hand(16) | L xyz+rotvec(6) | L hand(16)]
+#   state46  -> policy44 via quat_wxyz -> rotvec (same as π0.5)
+
+common:
+  img_history_size: 1
+  action_chunk_size: 32
+  num_cameras: 4
+  num_patches_per_view: 729
+  state_dim: 44
+
+dataset:
+  buf_path: /path/to/buffer
+  buf_num_chunks: 512
+  buf_chunk_size: 512
+  epsd_len_thresh_low: 32
+  epsd_len_thresh_high: 2048
+  image_aspect_ratio: pad
+  tokenizer_max_length: 1024
+
+model:
+  lang_adaptor: mlp2x_gelu
+  img_adaptor: mlp2x_gelu
+  state_adaptor: mlp3x_gelu
+  lang_token_dim: 4096
+  img_token_dim: 1152
+  state_token_dim: 44
+  rdt:
+    hidden_size: 1024
+    depth: 28
+    num_heads: 16
+    cond_pos_embed_type: multimodal
+  noise_scheduler:
+    type: ddpm
+    num_train_timesteps: 1000
+    num_inference_timesteps: 5
+    beta_schedule: squaredcos_cap_v2
+    # The 44-D TCP + Allegro I/O layers are rebuilt from scratch. Velocity
+    # prediction keeps low-SNR sampling bounded while those layers warm up;
+    # epsilon prediction amplifies their early error by ~2e4 at t=999.
+    prediction_type: v_prediction
+    clip_sample: False
+  ema:
+    update_after_step: 0
+    inv_gamma: 1.0
+    power: 0.75
+    min_value: 0.0
+    max_value: 0.9999
+
+embodiment:
+  name: "DexJoCo dual Panda + dual Allegro (bimanual_assembly insert)"
+  dof: 44
+  prompt: "Grasp the tray with the left hand and the peg with the right hand, then insert the peg into the hole."
+  state_elem_mask:
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+    - 1
+  # Order: [cam_high, cam_right_wrist, cam_left_wrist, cam_third_view]
+  # DexJoCo cameras: ego / wrist_left / wrist_right (no front).
+  camera_active_mask: [1, 1, 1, 0]
+  fps: 30
+  dataset_root: /mnt/hdd/dexora/data/dexjoco_bimanual_assembly_h264

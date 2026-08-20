@@ -68,6 +68,11 @@ class RDTRunner(
             num_train_timesteps=noise_scheduler_config['num_train_timesteps'],
             beta_schedule=noise_scheduler_config['beta_schedule'],
             prediction_type=noise_scheduler_config['prediction_type'],
+            thresholding=noise_scheduler_config.get('thresholding', False),
+            sample_max_value=noise_scheduler_config.get('sample_max_value', 1.0),
+            lambda_min_clipped=noise_scheduler_config.get(
+                'lambda_min_clipped', -float('inf')
+            ),
         )
 
         self.num_train_timesteps = noise_scheduler_config['num_train_timesteps']
@@ -166,7 +171,10 @@ class RDTRunner(
     def compute_loss(self, lang_tokens, lang_attn_mask, img_tokens,
                      state_tokens, action_gt, action_mask, ctrl_freqs,
                      sample_weights=None,
+                     horizon_weights=None,
                      return_dict: bool = False,
+                     noise=None,
+                     timesteps=None,
                     ):
         '''
         lang_tokens: (batch_size, lang_len, lang_token_dim)
@@ -191,14 +199,18 @@ class RDTRunner(
         device = lang_tokens.device
 
         # Sample noise that we'll add to the actions
-        noise = torch.randn(
-            action_gt.shape, dtype=action_gt.dtype, device=device
-        )
+        if noise is None:
+            noise = torch.randn(
+                action_gt.shape, dtype=action_gt.dtype, device=device
+            )
         # Sample random diffusion timesteps
-        timesteps = torch.randint(
-            0, self.num_train_timesteps,
-            (batch_size,), device=device
-        ).long()
+        if timesteps is None:
+            timesteps = torch.randint(
+                0, self.num_train_timesteps,
+                (batch_size,), device=device
+            ).long()
+        else:
+            timesteps = timesteps.to(device=device).long()
         # Add noise to the clean actions according to the noise magnitude at each timestep
         # (this is the forward diffusion process)
         noisy_action = self.noise_scheduler.add_noise(
@@ -220,16 +232,22 @@ class RDTRunner(
         pred_type = self.prediction_type
         if pred_type == 'epsilon':
             target = noise
+        elif pred_type == 'v_prediction':
+            target = self.noise_scheduler.get_velocity(action_gt, noise, timesteps)
         elif pred_type == 'sample':
             target = action_gt
         else:
             raise ValueError(f"Unsupported prediction type {pred_type}")
 
         # Per-sample MSE + optional Eq.(8) weighting. See models/sample_weighting.py.
-        loss, info = weighted_mse_loss(pred, target, sample_weights=sample_weights)
+        loss, info = weighted_mse_loss(
+            pred, target, sample_weights=sample_weights, horizon_weights=horizon_weights
+        )
         loss = loss.to(pred.dtype)
 
         if return_dict:
+            info["pred"] = pred
+            info["target"] = target
             return loss, info
         return loss
     

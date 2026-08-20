@@ -102,6 +102,9 @@ class VLAConsumerDataset(Dataset):
         bson_root=None,
         stats_file=None,
         state_dim_keep=36,
+        early_window_prob=0.0,
+        early_window_frames=32,
+        dexjoco_action_target="absolute",
     ):
         """
         ``use_hdf5`` selects the underlying dataset backend. Despite the legacy
@@ -151,7 +154,8 @@ class VLAConsumerDataset(Dataset):
         self.hdf5_dataset = None
         # Lazy backend import — keeps optional deps optional.
         if use_hdf5 == "lerobot":
-            from data.lerobot_vla_dataset import LeRobotVLADataset
+            from data.dexjoco_lerobot_dataset import maybe_make_lerobot_dataset
+            from data.dexjoco_remap import is_dexjoco_lerobot
             ds_kwargs = {}
             if lerobot_root is not None:
                 ds_kwargs["repo_dir"] = lerobot_root
@@ -159,7 +163,15 @@ class VLAConsumerDataset(Dataset):
                 ds_kwargs["stats_file"] = stats_file
             if state_dim_keep is not None:
                 ds_kwargs["state_dim_keep"] = int(state_dim_keep)
-            self.hdf5_dataset = LeRobotVLADataset(**ds_kwargs)
+            is_dexjoco = lerobot_root is not None and is_dexjoco_lerobot(lerobot_root)
+            if is_dexjoco:
+                ds_kwargs["action_target"] = dexjoco_action_target
+            if early_window_prob > 0.0:
+                ds_kwargs["early_window_prob"] = float(early_window_prob)
+                ds_kwargs["early_window_frames"] = int(early_window_frames)
+            self.hdf5_dataset = maybe_make_lerobot_dataset(**ds_kwargs)
+            if is_dexjoco:
+                self.control_freq["ours"] = 30
         elif use_hdf5 == "bson":
             from data.bson_vla_dataset_new import BsonVLADataset
             ds_kwargs = {}
@@ -336,6 +348,14 @@ class VLAConsumerDataset(Dataset):
                         0.0, state_std / np.sqrt(10 ** (self.state_noise_snr / 10)), 
                         states.shape)
                 ds_state_mean = np.array(self.dataset_stat[data_dict['dataset_name']]['state_mean'])
+                # DexJoCo finetune uses 44-D while built-in "ours" mean is 36-D.
+                dim = int(states.shape[-1])
+                if ds_state_mean.shape[0] < dim:
+                    ds_state_mean = np.concatenate(
+                        [ds_state_mean, np.zeros(dim - ds_state_mean.shape[0], dtype=ds_state_mean.dtype)]
+                    )
+                elif ds_state_mean.shape[0] > dim:
+                    ds_state_mean = ds_state_mean[:dim]
                 ds_state_mean = np.tile(ds_state_mean[None], (states.shape[0], 1))
                 # Randomly mask the states by the mean state
                 data_dict["states"] = states \

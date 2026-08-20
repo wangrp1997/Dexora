@@ -14,13 +14,11 @@ The wrapper takes care of:
 * Mapping the 4 raw camera images to per-camera SigLIP token sequences.
 * Encoding the (single) language instruction with T5 to ``[lang_len, 4096]``
   token embeddings + attention mask.
-* Concatenating the proprioceptive 36-D state into the ``state_tokens``
+* Concatenating the configured proprioceptive state into the ``state_tokens``
   expected by ``RDTRunner.predict_action``.
 
-The output is a numpy array of shape ``[chunk_size, 36]`` in the canonical
-order ``[left_arm(6) | right_arm(6) | left_hand(12) | right_hand(12)]``,
-all in radians — exactly the layout consumed by ``mmk_forwarder`` (arms,
-first 12 dims) and ``xhand_forwarder`` (hands, last 24 dims).
+The output is a numpy array of shape ``[chunk_size, state_dim]``. Its layout is
+defined by the selected model config and the corresponding deployment adapter.
 """
 
 from __future__ import annotations
@@ -104,11 +102,13 @@ class DexoraPolicy:
             self.cfg.chunk_size = cfg_chunk
 
         # ---- Load encoders -------------------------------------------------
+        local_only = os.environ.get("HF_HUB_OFFLINE", "").strip() in ("1", "true", "True")
         logging.info(f"Loading T5 text encoder from {self.cfg.text_encoder_path} ...")
         text_embedder = T5Embedder(
             from_pretrained=self.cfg.text_encoder_path,
             model_max_length=self.model_yaml["dataset"]["tokenizer_max_length"],
             device=self.device,
+            local_files_only=local_only,
         )
         self.tokenizer = text_embedder.tokenizer
         self.text_encoder = text_embedder.model.to(self.device, dtype=self.cfg.dtype).eval()
@@ -126,7 +126,7 @@ class DexoraPolicy:
         n_params = sum(p.numel() for p in self.policy.parameters())
         logging.info(f"[DexoraPolicy] policy params = {n_params/1e6:.1f}M")
 
-        # Static action mask (all dims active for the 36-DoF embodiment).
+        # Static action mask (all configured action dimensions are active).
         self._action_mask = torch.ones(
             (1, 1, self.cfg.state_dim), device=self.device, dtype=self.cfg.dtype
         )
@@ -180,25 +180,22 @@ class DexoraPolicy:
             ctrl_freqs=ctrl_freqs,
         )  # [1, chunk_size, state_dim]
 
-        return action_pred[0].float().cpu().numpy()
+        actions = action_pred[0].float().cpu().numpy()
+        action_anchor = obs.get("action_anchor")
+        if action_anchor is not None:
+            anchor = np.asarray(action_anchor, dtype=np.float32).reshape(-1)
+            if anchor.shape != (self.cfg.state_dim,):
+                raise ValueError(
+                    f"action_anchor must have shape {(self.cfg.state_dim,)}, got {anchor.shape}"
+                )
+            actions = actions + anchor[None, :]
+        return actions
 
     # -----------------------------------------------------------------------
     # Internals
     # -----------------------------------------------------------------------
     def _load_policy(self, model_path: str) -> RDTRunner:
-        """Try ``RDTRunner.from_pretrained`` first (HF format), then fall back
-        to a raw ``state_dict`` / ``pytorch_model.bin``.
-        """
-        if os.path.isdir(model_path):
-            try:
-                return RDTRunner.from_pretrained(model_path)
-            except Exception as e:
-                logging.warning(
-                    f"[DexoraPolicy] from_pretrained failed ({e}); "
-                    "constructing from config + raw state_dict instead."
-                )
-
-        # Manual construction path.
+        """Construct from the runtime YAML and strictly load checkpoint weights."""
         cfg = self.model_yaml
         img_cond_len = (
             cfg["common"]["img_history_size"]
@@ -228,22 +225,34 @@ class DexoraPolicy:
         # Resolve raw state-dict path
         if os.path.isfile(model_path):
             sd_path = model_path
+            if sd_path.endswith(".safetensors"):
+                from safetensors.torch import load_file
+
+                sd = load_file(sd_path, device="cpu")
+            else:
+                sd = torch.load(sd_path, map_location="cpu")
         else:
-            sd_path = os.path.join(model_path, "pytorch_model.bin")
-            if not os.path.exists(sd_path):
+            bin_path = os.path.join(model_path, "pytorch_model.bin")
+            st_path = os.path.join(model_path, "model.safetensors")
+            if os.path.isfile(bin_path):
+                sd = torch.load(bin_path, map_location="cpu")
+            elif os.path.isfile(st_path):
+                from safetensors.torch import load_file
+
+                sd = load_file(st_path, device="cpu")
+            else:
                 raise FileNotFoundError(
-                    f"No ``pytorch_model.bin`` under {model_path}; please pass "
-                    "a HF-style checkpoint directory or a state_dict file."
+                    f"No pytorch_model.bin / model.safetensors under {model_path}"
                 )
-        sd = torch.load(sd_path, map_location="cpu")
         if isinstance(sd, dict):
             sd = sd.get("module", sd.get("model_state_dict", sd.get("state_dict", sd)))
-        missing, unexpected = policy.load_state_dict(sd, strict=False)
-        if missing or unexpected:
-            logging.warning(
-                f"[DexoraPolicy] state_dict load: missing={len(missing)} "
-                f"unexpected={len(unexpected)}"
-            )
+        try:
+            policy.load_state_dict(sd, strict=True)
+        except RuntimeError as exc:
+            raise RuntimeError(
+                f"Checkpoint {model_path} is incompatible with the configured "
+                f"{cfg['common']['state_dim']}-D Dexora policy"
+            ) from exc
         return policy
 
     def _encode_language(self, instruction: str) -> tuple[torch.Tensor, torch.Tensor]:
